@@ -1,0 +1,3 @@
+numpy
+smplx[all]
+torch
