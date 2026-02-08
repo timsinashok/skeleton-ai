@@ -21,7 +21,7 @@ except Exception as exc:  # pragma: no cover - runtime dependency
     raise SystemExit("torch is required. Install with: pip install torch") from exc
 
 
-STEP_RAD = 0.08
+STEP_RAD = 0.12
 
 # SMPL-X body_pose has 21 joints (root rotation is global_orient).
 SMPLX_BODY_JOINTS = [
@@ -67,8 +67,7 @@ CONTROL_JOINTS = [
 ]
 
 
-# Map SMPL-X joint -> robot joint (name fragment) + axis + scale.
-# You will likely tweak these once you inspect robot joint names.
+# Map SMPL-X joint -> robot joint name + axis + scale.
 RETARGET_MAP = [
     ("left_hip", "left_hip", np.array([1.0, 0.0, 0.0]), 1.0),
     ("right_hip", "right_hip", np.array([1.0, 0.0, 0.0]), 1.0),
@@ -76,29 +75,34 @@ RETARGET_MAP = [
     ("right_knee", "right_knee", np.array([1.0, 0.0, 0.0]), 1.0),
     ("left_ankle", "left_ankle", np.array([1.0, 0.0, 0.0]), 1.0),
     ("right_ankle", "right_ankle", np.array([1.0, 0.0, 0.0]), 1.0),
-    ("spine1", "spine", np.array([1.0, 0.0, 0.0]), 0.5),
-    ("spine2", "spine", np.array([1.0, 0.0, 0.0]), 0.5),
-    ("spine3", "spine", np.array([1.0, 0.0, 0.0]), 0.5),
+    ("spine1", "chest", np.array([1.0, 0.0, 0.0]), 0.5),
+    ("spine2", "chest", np.array([1.0, 0.0, 0.0]), 0.5),
+    ("spine3", "chest", np.array([1.0, 0.0, 0.0]), 0.5),
     ("left_shoulder", "left_shoulder", np.array([1.0, 0.0, 0.0]), 1.0),
     ("right_shoulder", "right_shoulder", np.array([1.0, 0.0, 0.0]), 1.0),
     ("left_elbow", "left_elbow", np.array([1.0, 0.0, 0.0]), 1.0),
     ("right_elbow", "right_elbow", np.array([1.0, 0.0, 0.0]), 1.0),
     ("neck", "neck", np.array([1.0, 0.0, 0.0]), 1.0),
-    ("head", "head", np.array([1.0, 0.0, 0.0]), 1.0),
+    ("head", "neck", np.array([1.0, 0.0, 0.0]), 0.3),
 ]
 
-# Rest pose offsets for pybullet_data humanoid to keep it visibly upright.
-ROBOT_STAND_OFFSETS = {
-    "left_hip": -0.15,
-    "right_hip": -0.15,
-    "left_knee": 0.30,
-    "right_knee": 0.30,
-    "left_ankle": -0.15,
-    "right_ankle": -0.15,
-    "left_shoulder": 0.20,
-    "right_shoulder": -0.20,
-    "left_elbow": -0.25,
-    "right_elbow": 0.25,
+# Rest pose offsets.
+ROBOT_STAND_SCALAR = {
+    "left_knee": -0.55,
+    "right_knee": -0.55,
+    "left_elbow": 0.55,
+    "right_elbow": 0.55,
+}
+
+ROBOT_STAND_EULER = {
+    "left_hip": np.array([0.15, 0.00, -0.05], dtype=np.float32),
+    "right_hip": np.array([0.15, 0.00, 0.05], dtype=np.float32),
+    "left_ankle": np.array([-0.10, 0.00, 0.00], dtype=np.float32),
+    "right_ankle": np.array([-0.10, 0.00, 0.00], dtype=np.float32),
+    "left_shoulder": np.array([0.10, 0.00, 0.00], dtype=np.float32),
+    "right_shoulder": np.array([0.10, 0.00, 0.00], dtype=np.float32),
+    "chest": np.array([0.00, 0.00, 0.00], dtype=np.float32),
+    "neck": np.array([0.00, 0.00, 0.00], dtype=np.float32),
 }
 
 
@@ -176,6 +180,14 @@ def build_joint_limits(body_id: int):
     return limits
 
 
+def build_joint_types(body_id: int):
+    types = {}
+    for i in range(p.getNumJoints(body_id)):
+        info = p.getJointInfo(body_id, i)
+        types[i] = int(info[2])
+    return types
+
+
 def build_robot_tree(body_id: int):
     edges = []
     for i in range(p.getNumJoints(body_id)):
@@ -210,6 +222,20 @@ def clamp_to_joint_limits(value: float, lower: float, upper: float) -> float:
     if np.isfinite(lower) and np.isfinite(upper) and lower < upper:
         return float(clamp(value, lower, upper))
     return float(value)
+
+
+def apply_joint_target(body_id: int, joint_idx: int, joint_type: int, angle_vec: np.ndarray, scalar: float):
+    # 2 = JOINT_SPHERICAL, 0 = JOINT_REVOLUTE
+    if joint_type == p.JOINT_SPHERICAL:
+        quat = p.getQuaternionFromEuler(angle_vec.tolist())
+        p.resetJointStateMultiDof(
+            body_id,
+            joint_idx,
+            targetValue=quat,
+            targetVelocity=[0.0, 0.0, 0.0],
+        )
+    elif joint_type == p.JOINT_REVOLUTE:
+        p.resetJointState(body_id, joint_idx, targetValue=scalar, targetVelocity=0.0)
 
 
 def key_is_down(keys: dict, key_code: int) -> bool:
@@ -267,11 +293,14 @@ def main():
     if args.wireframe:
         p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 1)
     _, robot_id = load_robot(args.urdf)
+    upright_base_orn = p.getQuaternionFromEuler([np.pi / 2.0, 0.0, 0.0])
+    upright_base_pos = [0.0, 0.0, 3.6]
+    p.resetBasePositionAndOrientation(robot_id, upright_base_pos, upright_base_orn)
     p.resetDebugVisualizerCamera(
-        cameraDistance=3.5,
+        cameraDistance=6.5,
         cameraYaw=45,
-        cameraPitch=-15,
-        cameraTargetPosition=[0, 0, 1.0],
+        cameraPitch=-20,
+        cameraTargetPosition=[0, 0, 1.8],
     )
     p.addUserDebugLine([0, 0, 0], [1, 0, 0], [1, 0, 0], lineWidth=2)
     p.addUserDebugLine([0, 0, 0], [0, 1, 0], [0, 1, 0], lineWidth=2)
@@ -289,19 +318,27 @@ def main():
     p.createMultiBody(baseMass=0, baseVisualShapeIndex=sphere, basePosition=[0, 0, 1.0])
     joint_index = build_robot_joint_index(robot_id)
     joint_limits = build_joint_limits(robot_id)
+    joint_types = build_joint_types(robot_id)
     robot_joint_targets = {}
-    for _, robot_fragment, _, _ in RETARGET_MAP:
-        idx = resolve_robot_joint(joint_index, robot_fragment)
-        if idx is not None:
-            robot_joint_targets[robot_fragment] = idx
+    for _, robot_name, _, _ in RETARGET_MAP:
+        if robot_name in joint_index:
+            robot_joint_targets[robot_name] = joint_index[robot_name]
+        else:
+            idx = resolve_robot_joint(joint_index, robot_name)
+            if idx is not None:
+                robot_joint_targets[robot_name] = idx
 
-    # Apply initial standing offsets.
-    for joint_name, offset in ROBOT_STAND_OFFSETS.items():
-        idx = resolve_robot_joint(joint_index, joint_name)
+    # Apply initial standing offsets for both spherical and revolute joints.
+    for joint_name, offset in ROBOT_STAND_SCALAR.items():
+        idx = joint_index.get(joint_name)
         if idx is not None:
             lower, upper = joint_limits.get(idx, (-np.inf, np.inf))
             offset = clamp_to_joint_limits(offset, lower, upper)
-            p.resetJointState(robot_id, idx, targetValue=offset, targetVelocity=0.0)
+            apply_joint_target(robot_id, idx, joint_types.get(idx, -1), np.zeros(3, dtype=np.float32), offset)
+    for joint_name, euler in ROBOT_STAND_EULER.items():
+        idx = joint_index.get(joint_name)
+        if idx is not None:
+            apply_joint_target(robot_id, idx, joint_types.get(idx, -1), euler, 0.0)
     robot_edges = build_robot_tree(robot_id)
     skeleton_line_ids = []
 
@@ -314,8 +351,8 @@ def main():
     selected = 0
     last_text_id = None
     last_debug_log = 0.0
-    base_pos_lock = [0.0, 0.0, 1.0]
-    base_orn_lock = [0.0, 0.0, 0.0, 1.0]
+    base_pos_lock = upright_base_pos
+    base_orn_lock = upright_base_orn
 
     def update_hud():
         nonlocal last_text_id
@@ -336,12 +373,14 @@ def main():
             if args.debug_keys:
                 # Print compact key diagnostics for troubleshooting focus/input issues.
                 print("[keys]", sorted(keys.items()))
-            if key_triggered(keys, ord("[")):
+            if key_triggered(keys, ord("[")) or key_triggered(keys, ord(",")) or key_triggered(keys, ord("n")) or key_triggered(keys, ord("N")):
                 selected = (selected - 1) % len(CONTROL_JOINTS)
                 update_hud()
-            if key_triggered(keys, ord("]")):
+                print(f"[select] {selected}: {CONTROL_JOINTS[selected]}")
+            if key_triggered(keys, ord("]")) or key_triggered(keys, ord(".")) or key_triggered(keys, ord("m")) or key_triggered(keys, ord("M")):
                 selected = (selected + 1) % len(CONTROL_JOINTS)
                 update_hud()
+                print(f"[select] {selected}: {CONTROL_JOINTS[selected]}")
             if key_triggered(keys, ord("0")):
                 body_pose[:] = 0
             if key_triggered(keys, ord("r")) or key_triggered(keys, ord("R")):
@@ -380,23 +419,27 @@ def main():
         )
 
         # Retarget to robot joints
-        for smpl_joint, robot_fragment, axis, scale in RETARGET_MAP:
+        for smpl_joint, robot_name, axis, scale in RETARGET_MAP:
             if smpl_joint not in joint_to_idx:
                 continue
             smpl_idx = joint_to_idx[smpl_joint]
             aa = body_pose[smpl_idx]
-            # Robot joints are mostly 1-DoF. Map all user controls into one scalar
-            # so pitch/yaw/roll keys all produce visible motion in this POC.
-            angle = float(np.sum(aa)) * scale
-            robot_idx = robot_joint_targets.get(robot_fragment)
+            robot_idx = robot_joint_targets.get(robot_name)
             if robot_idx is None:
-                robot_idx = resolve_robot_joint(joint_index, robot_fragment)
+                robot_idx = resolve_robot_joint(joint_index, robot_name)
             if robot_idx is None:
                 continue
-            angle += ROBOT_STAND_OFFSETS.get(robot_fragment, 0.0)
-            lower, upper = joint_limits.get(robot_idx, (-np.inf, np.inf))
-            angle = clamp_to_joint_limits(angle, lower, upper)
-            p.resetJointState(robot_id, robot_idx, targetValue=angle, targetVelocity=0.0)
+            jt = joint_types.get(robot_idx, -1)
+            if jt == p.JOINT_SPHERICAL:
+                base_euler = ROBOT_STAND_EULER.get(robot_name, np.zeros(3, dtype=np.float32))
+                target_euler = base_euler + (aa * scale)
+                apply_joint_target(robot_id, robot_idx, jt, target_euler, 0.0)
+            elif jt == p.JOINT_REVOLUTE:
+                angle = float(np.dot(axis, aa)) * scale
+                angle += ROBOT_STAND_SCALAR.get(robot_name, 0.0)
+                lower, upper = joint_limits.get(robot_idx, (-np.inf, np.inf))
+                angle = clamp_to_joint_limits(angle, lower, upper)
+                apply_joint_target(robot_id, robot_idx, jt, np.zeros(3, dtype=np.float32), angle)
 
         # Keep base fixed for a pure retargeting POC (no balance/physics).
         p.resetBasePositionAndOrientation(robot_id, base_pos_lock, base_orn_lock)
