@@ -21,7 +21,7 @@ except Exception as exc:  # pragma: no cover - runtime dependency
     raise SystemExit("torch is required. Install with: pip install torch") from exc
 
 
-STEP_RAD = 0.05
+STEP_RAD = 0.08
 
 # SMPL-X body_pose has 21 joints (root rotation is global_orient).
 SMPLX_BODY_JOINTS = [
@@ -87,6 +87,20 @@ RETARGET_MAP = [
     ("head", "head", np.array([1.0, 0.0, 0.0]), 1.0),
 ]
 
+# Rest pose offsets for pybullet_data humanoid to keep it visibly upright.
+ROBOT_STAND_OFFSETS = {
+    "left_hip": -0.15,
+    "right_hip": -0.15,
+    "left_knee": 0.30,
+    "right_knee": 0.30,
+    "left_ankle": -0.15,
+    "right_ankle": -0.15,
+    "left_shoulder": 0.20,
+    "right_shoulder": -0.20,
+    "left_elbow": -0.25,
+    "right_elbow": 0.25,
+}
+
 
 def resolve_model_folder(root: str) -> str:
     # Accept absolute path or relative to current working dir or this script location.
@@ -146,6 +160,39 @@ def build_robot_joint_index(body_id: int):
     return joint_index
 
 
+def resolve_robot_joint(joint_index: dict, key: str):
+    if key in joint_index:
+        return joint_index[key]
+    return pick_robot_joint(joint_index, key)
+
+
+def build_joint_limits(body_id: int):
+    limits = {}
+    for i in range(p.getNumJoints(body_id)):
+        info = p.getJointInfo(body_id, i)
+        lower = float(info[8])
+        upper = float(info[9])
+        limits[i] = (lower, upper)
+    return limits
+
+
+def build_robot_tree(body_id: int):
+    edges = []
+    for i in range(p.getNumJoints(body_id)):
+        info = p.getJointInfo(body_id, i)
+        parent = info[16]
+        edges.append((parent, i))
+    return edges
+
+
+def get_link_world_pos(body_id: int, link_idx: int):
+    if link_idx == -1:
+        pos, _ = p.getBasePositionAndOrientation(body_id)
+        return pos
+    state = p.getLinkState(body_id, link_idx, computeForwardKinematics=True)
+    return state[0]
+
+
 def pick_robot_joint(joint_index: dict, fragment: str):
     fragment = fragment.lower()
     for name, idx in joint_index.items():
@@ -158,6 +205,21 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
+def clamp_to_joint_limits(value: float, lower: float, upper: float) -> float:
+    # Some joints expose invalid/no limits; only clamp when limits are valid.
+    if np.isfinite(lower) and np.isfinite(upper) and lower < upper:
+        return float(clamp(value, lower, upper))
+    return float(value)
+
+
+def key_is_down(keys: dict, key_code: int) -> bool:
+    return bool(keys.get(key_code, 0) & p.KEY_IS_DOWN)
+
+
+def key_triggered(keys: dict, key_code: int) -> bool:
+    return bool(keys.get(key_code, 0) & p.KEY_WAS_TRIGGERED)
+
+
 def main():
     parser = argparse.ArgumentParser(description="SMPL-X to PyBullet humanoid retarget POC")
     parser.add_argument("--model-folder", default="assets/smplx", help="Folder with SMPL-X models/")
@@ -167,6 +229,14 @@ def main():
         default=os.path.join(pybullet_data.getDataPath(), "humanoid/humanoid.urdf"),
         help="Path to humanoid URDF",
     )
+    parser.add_argument("--wireframe", action="store_true", help="Enable wireframe rendering")
+    parser.add_argument("--debug-keys", action="store_true", help="Print key event codes seen by PyBullet")
+    parser.add_argument("--self-test", action="store_true", help="Drive joints with a sine wave (no keyboard needed)")
+    parser.add_argument(
+        "--gui-options",
+        default="",
+        help="Optional PyBullet GUI options, e.g. '--opengl2'",
+    )
     parser.add_argument("--print-robot-joints", action="store_true", help="List robot joint names and exit")
     args = parser.parse_args()
 
@@ -174,24 +244,33 @@ def main():
     if not os.path.isdir(model_folder):
         raise SystemExit(f"Model folder not found: {model_folder}")
 
+    if args.model_file is not None and args.model_file.startswith("--"):
+        raise SystemExit("Invalid --model-file value. Provide an absolute path to .npz/.pkl.")
+
     model_file = args.model_file or resolve_model_file(model_folder)
+    if model_file is not None and not os.path.isfile(model_file):
+        raise SystemExit(f"Model file not found: {model_file}")
     model = create_smplx_model(model_folder, model_file)
     body_pose = np.zeros((len(SMPLX_BODY_JOINTS), 3), dtype=np.float32)
     global_orient = np.zeros((1, 3), dtype=np.float32)
     joint_to_idx = {name: idx for idx, name in enumerate(SMPLX_BODY_JOINTS)}
 
-    p.connect(p.GUI)
-    p.setGravity(0, 0, -9.8)
+    if args.gui_options.strip():
+        p.connect(p.GUI, options=args.gui_options)
+    else:
+        p.connect(p.GUI)
+    # Kinematic POC: disable gravity to avoid physics instability.
+    p.setGravity(0, 0, 0)
     p.setRealTimeSimulation(0)
     p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
     p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0)
-    # Avoid flicker while loading.
-    p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
+    if args.wireframe:
+        p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 1)
     _, robot_id = load_robot(args.urdf)
     p.resetDebugVisualizerCamera(
-        cameraDistance=1.5,
+        cameraDistance=3.5,
         cameraYaw=45,
-        cameraPitch=-25,
+        cameraPitch=-15,
         cameraTargetPosition=[0, 0, 1.0],
     )
     p.addUserDebugLine([0, 0, 0], [1, 0, 0], [1, 0, 0], lineWidth=2)
@@ -202,11 +281,29 @@ def main():
     print(f"Robot base pose: {p.getBasePositionAndOrientation(robot_id)}")
     if len(visuals) == 0:
         print("Warning: robot has no visual shapes; check URDF mesh paths.")
+    # Force bright colors so the robot is visible.
+    for link_index in range(-1, p.getNumJoints(robot_id)):
+        p.changeVisualShape(robot_id, link_index, rgbaColor=[1, 0.2, 0.2, 1])
     # Debug sphere to verify camera framing
     sphere = p.createVisualShape(p.GEOM_SPHERE, radius=0.05, rgbaColor=[1, 0, 0, 1])
     p.createMultiBody(baseMass=0, baseVisualShapeIndex=sphere, basePosition=[0, 0, 1.0])
-    p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
     joint_index = build_robot_joint_index(robot_id)
+    joint_limits = build_joint_limits(robot_id)
+    robot_joint_targets = {}
+    for _, robot_fragment, _, _ in RETARGET_MAP:
+        idx = resolve_robot_joint(joint_index, robot_fragment)
+        if idx is not None:
+            robot_joint_targets[robot_fragment] = idx
+
+    # Apply initial standing offsets.
+    for joint_name, offset in ROBOT_STAND_OFFSETS.items():
+        idx = resolve_robot_joint(joint_index, joint_name)
+        if idx is not None:
+            lower, upper = joint_limits.get(idx, (-np.inf, np.inf))
+            offset = clamp_to_joint_limits(offset, lower, upper)
+            p.resetJointState(robot_id, idx, targetValue=offset, targetVelocity=0.0)
+    robot_edges = build_robot_tree(robot_id)
+    skeleton_line_ids = []
 
     if args.print_robot_joints:
         print("Robot joints:")
@@ -216,13 +313,19 @@ def main():
 
     selected = 0
     last_text_id = None
+    last_debug_log = 0.0
+    base_pos_lock = [0.0, 0.0, 1.0]
+    base_orn_lock = [0.0, 0.0, 0.0, 1.0]
 
     def update_hud():
         nonlocal last_text_id
         if last_text_id is not None:
             p.removeUserDebugItem(last_text_id)
         joint_name = CONTROL_JOINTS[selected]
-        msg = f"Joint: {joint_name} | keys: arrows=Pitch/Yaw, Q/E=Roll, [ ]=select, R=reset, 0=reset all"
+        msg = (
+            f"Joint: {joint_name} | select:[ ] | pitch:Up/Down or U/J | "
+            f"yaw:Left/Right or H/K | roll:Q/E or Y/I | R reset | 0 reset all"
+        )
         last_text_id = p.addUserDebugText(msg, [0, 0, 1.8], textSize=1.2)
 
     update_hud()
@@ -230,29 +333,32 @@ def main():
     while True:
         keys = p.getKeyboardEvents()
         if keys:
-            if ord("[") in keys and keys[ord("[")] & p.KEY_WAS_TRIGGERED:
+            if args.debug_keys:
+                # Print compact key diagnostics for troubleshooting focus/input issues.
+                print("[keys]", sorted(keys.items()))
+            if key_triggered(keys, ord("[")):
                 selected = (selected - 1) % len(CONTROL_JOINTS)
                 update_hud()
-            if ord("]") in keys and keys[ord("]")] & p.KEY_WAS_TRIGGERED:
+            if key_triggered(keys, ord("]")):
                 selected = (selected + 1) % len(CONTROL_JOINTS)
                 update_hud()
-            if ord("0") in keys and keys[ord("0")] & p.KEY_WAS_TRIGGERED:
+            if key_triggered(keys, ord("0")):
                 body_pose[:] = 0
-            if ord("r") in keys and keys[ord("r")] & p.KEY_WAS_TRIGGERED:
+            if key_triggered(keys, ord("r")) or key_triggered(keys, ord("R")):
                 body_pose[joint_to_idx[CONTROL_JOINTS[selected]]] = 0
 
             delta = np.zeros(3, dtype=np.float32)
-            if p.B3G_UP_ARROW in keys:
+            if key_is_down(keys, p.B3G_UP_ARROW) or key_is_down(keys, ord("u")) or key_is_down(keys, ord("U")):
                 delta[0] += STEP_RAD
-            if p.B3G_DOWN_ARROW in keys:
+            if key_is_down(keys, p.B3G_DOWN_ARROW) or key_is_down(keys, ord("j")) or key_is_down(keys, ord("J")):
                 delta[0] -= STEP_RAD
-            if p.B3G_LEFT_ARROW in keys:
+            if key_is_down(keys, p.B3G_LEFT_ARROW) or key_is_down(keys, ord("h")) or key_is_down(keys, ord("H")):
                 delta[1] += STEP_RAD
-            if p.B3G_RIGHT_ARROW in keys:
+            if key_is_down(keys, p.B3G_RIGHT_ARROW) or key_is_down(keys, ord("k")) or key_is_down(keys, ord("K")):
                 delta[1] -= STEP_RAD
-            if ord("q") in keys:
+            if key_is_down(keys, ord("q")) or key_is_down(keys, ord("Q")) or key_is_down(keys, ord("y")) or key_is_down(keys, ord("Y")):
                 delta[2] += STEP_RAD
-            if ord("e") in keys:
+            if key_is_down(keys, ord("e")) or key_is_down(keys, ord("E")) or key_is_down(keys, ord("i")) or key_is_down(keys, ord("I")):
                 delta[2] -= STEP_RAD
             if np.any(delta):
                 idx = joint_to_idx[CONTROL_JOINTS[selected]]
@@ -260,6 +366,11 @@ def main():
                 body_pose[idx] = np.array(
                     [clamp(v, -2.0, 2.0) for v in body_pose[idx]], dtype=np.float32
                 )
+        if args.self_test:
+            t = time.time()
+            for jn in CONTROL_JOINTS:
+                idx = joint_to_idx[jn]
+                body_pose[idx, 0] = 0.35 * np.sin(t * 1.6 + idx * 0.4)
 
         # Forward SMPL-X (not used for mesh rendering here, but validates the model path)
         # smplx expects torch tensors
@@ -274,17 +385,50 @@ def main():
                 continue
             smpl_idx = joint_to_idx[smpl_joint]
             aa = body_pose[smpl_idx]
-            angle = float(np.dot(axis, aa)) * scale
-            robot_idx = pick_robot_joint(joint_index, robot_fragment)
+            # Robot joints are mostly 1-DoF. Map all user controls into one scalar
+            # so pitch/yaw/roll keys all produce visible motion in this POC.
+            angle = float(np.sum(aa)) * scale
+            robot_idx = robot_joint_targets.get(robot_fragment)
+            if robot_idx is None:
+                robot_idx = resolve_robot_joint(joint_index, robot_fragment)
             if robot_idx is None:
                 continue
-            p.setJointMotorControl2(
-                robot_id,
-                robot_idx,
-                controlMode=p.POSITION_CONTROL,
-                targetPosition=angle,
-                force=150,
+            angle += ROBOT_STAND_OFFSETS.get(robot_fragment, 0.0)
+            lower, upper = joint_limits.get(robot_idx, (-np.inf, np.inf))
+            angle = clamp_to_joint_limits(angle, lower, upper)
+            p.resetJointState(robot_id, robot_idx, targetValue=angle, targetVelocity=0.0)
+
+        # Keep base fixed for a pure retargeting POC (no balance/physics).
+        p.resetBasePositionAndOrientation(robot_id, base_pos_lock, base_orn_lock)
+
+        # Draw a debug skeleton overlay that stays visible even when mesh rendering glitches.
+        for line_idx, (parent_idx, child_idx) in enumerate(robot_edges):
+            parent_pos = get_link_world_pos(robot_id, parent_idx)
+            child_pos = get_link_world_pos(robot_id, child_idx)
+            replace_id = skeleton_line_ids[line_idx] if line_idx < len(skeleton_line_ids) else -1
+            new_id = p.addUserDebugLine(
+                parent_pos,
+                child_pos,
+                lineColorRGB=[1.0, 0.2, 0.2],
+                lineWidth=3.0,
+                lifeTime=0.0,
+                replaceItemUniqueId=replace_id,
             )
+            if line_idx < len(skeleton_line_ids):
+                skeleton_line_ids[line_idx] = new_id
+            else:
+                skeleton_line_ids.append(new_id)
+
+        now = time.time()
+        if now - last_debug_log > 2.0:
+            base_pos, _ = p.getBasePositionAndOrientation(robot_id)
+            print(f"[debug] base_pos={base_pos}")
+            if not np.all(np.isfinite(base_pos)):
+                print("[debug] detected NaN base pose, resetting robot state")
+                p.resetBasePositionAndOrientation(robot_id, [0, 0, 1.0], [0, 0, 0, 1])
+                for j in range(p.getNumJoints(robot_id)):
+                    p.resetJointState(robot_id, j, targetValue=0.0, targetVelocity=0.0)
+            last_debug_log = now
 
         p.stepSimulation()
         time.sleep(1.0 / 60.0)
